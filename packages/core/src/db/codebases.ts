@@ -97,12 +97,50 @@ export async function registerCommand(
   await updateCodebaseCommands(id, commands);
 }
 
+/**
+ * Extract "owner/repo" slug from any git URL format:
+ *   - https://github.com/owner/repo
+ *   - https://github.com/owner/repo.git
+ *   - git@github.com:owner/repo.git
+ *   - git@github.com:owner/repo
+ * Returns null if the URL doesn't match any known pattern.
+ */
+function extractRepoSlug(url: string): string | null {
+  // SSH: git@github.com:owner/repo(.git)
+  const sshMatch = /^git@[^:]+:(.+?)(?:\.git)?$/.exec(url);
+  if (sshMatch?.[1]) return sshMatch[1];
+
+  // HTTPS: https://github.com/owner/repo(.git)
+  const httpsMatch = /^https?:\/\/[^/]+\/(.+?)(?:\.git)?$/.exec(url);
+  if (httpsMatch?.[1]) return httpsMatch[1];
+
+  return null;
+}
+
+/**
+ * Find a codebase by repository URL.
+ * Tries exact match first, then falls back to matching by owner/repo slug
+ * extracted from the URL. This handles SSH vs HTTPS and .git suffix differences.
+ */
 export async function findCodebaseByRepoUrl(repoUrl: string): Promise<Codebase | null> {
-  const result = await pool.query<Codebase>(
+  // Exact match first (fast path)
+  const exact = await pool.query<Codebase>(
     'SELECT * FROM remote_agent_codebases WHERE repository_url = $1',
     [repoUrl]
   );
-  return result.rows[0] || null;
+  if (exact.rows[0]) return exact.rows[0];
+
+  // Fallback: extract owner/repo slug and match by name
+  const slug = extractRepoSlug(repoUrl);
+  if (slug) {
+    const byName = await pool.query<Codebase>(
+      'SELECT * FROM remote_agent_codebases WHERE name = $1 ORDER BY created_at ASC LIMIT 1',
+      [slug]
+    );
+    if (byName.rows[0]) return byName.rows[0];
+  }
+
+  return null;
 }
 
 export async function findCodebaseByDefaultCwd(defaultCwd: string): Promise<Codebase | null> {

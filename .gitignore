@@ -120,9 +120,10 @@ packages/server/.env
 skills-lock.json
 test-results/
 .archon/ralph/
-
 # Stray run logs from a mis-threaded logDir argument (see #2299) — never committed.
 main/
 
 # Personal per-run config overlays (workflow run --config) — never tracked
 .config.*.yaml
+
+.history

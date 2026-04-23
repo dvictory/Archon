@@ -27,6 +27,7 @@ export type CodebaseResponse = components['schemas']['Codebase'];
 export interface HealthResponse {
   status: string;
   adapter: string;
+  activePlatforms: string[];
   concurrency: {
     active: number;
     queuedTotal: number;
@@ -38,7 +39,6 @@ export interface HealthResponse {
   is_wsl: boolean;
   /** WSL distribution name (e.g. "Ubuntu") — only present when is_wsl is true. */
   wsl_distro?: string;
-  activePlatforms?: string[];
 }
 
 async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {

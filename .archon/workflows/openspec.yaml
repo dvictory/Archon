@@ -1,0 +1,174 @@
+name: openspec
+description: |
+  Use when: User wants to plan and implement a feature using the OpenSpec OPSX process.
+  Triggers: "openspec", "opsx", "spec-driven", "propose a change", "openspec propose",
+            "create a change", "plan with specs".
+  Does: Creates an OpenSpec change with proposal, specs, design, and tasks artifacts,
+        then implements after human approval. Follows the fluid, iterative OPSX workflow.
+  NOT for: Quick fixes without planning, PR reviews, bug triage.
+
+  OpenSpec OPSX workflow — fluid, iterative spec-driven development:
+  1. Initialize change directory structure
+  2. Generate proposal.md (intent, scope, approach)
+  3. Generate delta specs (requirements + Given/When/Then scenarios) — parallel with design
+  4. Generate design.md (technical approach) — parallel with specs
+  5. Generate tasks.md (implementation checklist) — after specs + design
+  6. Human approval gate — review all artifacts before implementation
+  7. Implement tasks (loop with fresh context per iteration)
+  8. Archive completed change
+
+interactive: true
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 0: INITIALIZE — Create change directory structure
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: init-change
+    bash: |
+      set -e
+
+      # Convert arguments to kebab-case change name
+      RAW_ARGS="$ARGUMENTS"
+      CHANGE_NAME=$(printf '%s' "$RAW_ARGS" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')
+
+      if [ -z "$CHANGE_NAME" ]; then
+        echo "ERROR: No change name provided. Pass a description as the workflow argument." >&2
+        exit 1
+      fi
+
+      CHANGE_DIR="openspec/changes/${CHANGE_NAME}"
+
+      # Create change directory structure
+      mkdir -p "${CHANGE_DIR}/specs"
+      mkdir -p openspec/specs
+
+      # Create .openspec.yaml metadata
+      cat > "${CHANGE_DIR}/.openspec.yaml" <<METAEOF
+      schema: spec-driven
+      created: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      name: ${CHANGE_NAME}
+      METAEOF
+
+      # Write path and description for downstream command nodes
+      echo "${CHANGE_DIR}" > "$ARTIFACTS_DIR/change-dir.txt"
+      printf '%s' "$RAW_ARGS" > "$ARTIFACTS_DIR/change-description.txt"
+
+      echo "${CHANGE_DIR}"
+    timeout: 10000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: PROPOSE — Explore codebase and generate proposal
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: generate-proposal
+    command: openspec-generate-proposal
+    depends_on: [init-change]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: SPECS + DESIGN — Generate in parallel (both depend on proposal)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: generate-specs
+    command: openspec-generate-specs
+    depends_on: [generate-proposal]
+    context: fresh
+
+  - id: generate-design
+    command: openspec-generate-design
+    depends_on: [generate-proposal]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: TASKS — Generate implementation checklist
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: generate-tasks
+    command: openspec-generate-tasks
+    depends_on: [generate-specs, generate-design]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: REVIEW GATE — Human reviews all artifacts
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review-gate
+    approval:
+      message: |
+        All planning artifacts have been generated in the change directory.
+
+        Please review:
+        - **proposal.md** — Intent, scope, and approach
+        - **specs/** — Delta requirements with Given/When/Then scenarios
+        - **design.md** — Technical architecture and implementation details
+        - **tasks.md** — Implementation checklist with file paths
+
+        Approve to proceed with implementation, or reject with feedback to revise.
+      capture_response: true
+    depends_on: [generate-tasks]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: IMPLEMENT — Work through tasks iteratively
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    depends_on: [review-gate]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        You are implementing changes for an OpenSpec change. FRESH SESSION — no memory of prior iterations.
+
+        ## Setup
+
+        1. Read `$ARTIFACTS_DIR/change-dir.txt` to get the change directory path
+        2. Read `tasks.md` in that directory to find the next unchecked `[ ]` task
+        3. Read `proposal.md`, `design.md`, and files in `specs/` for full context
+
+        ## Review Feedback
+
+        The reviewer said: $review-gate.output
+
+        ## Instructions
+
+        - Implement exactly ONE unchecked task
+        - Follow the technical approach described in design.md
+        - Ensure your implementation satisfies the requirements in the specs
+        - After implementing, mark the task as `[x]` in tasks.md using the Edit tool
+        - Run any relevant tests or type-checks to validate your changes
+
+        ## Completion
+
+        If ALL tasks in tasks.md are checked `[x]`, signal completion:
+        <promise>COMPLETE</promise>
+
+        Otherwise, summarize what you implemented and what's next.
+      until: COMPLETE
+      max_iterations: 20
+      fresh_context: true
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: ARCHIVE — Move completed change to archive
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: archive
+    prompt: |
+      You are archiving a completed OpenSpec change.
+
+      ## Instructions
+
+      1. Read `$ARTIFACTS_DIR/change-dir.txt` to get the change directory path (e.g., `openspec/changes/add-dark-mode`)
+      2. Extract the change name from the path
+      3. Create the archive directory: `openspec/changes/archive/` (if it doesn't exist)
+      4. Use Bash to move the change directory to the archive with a date prefix:
+         ```
+         mkdir -p openspec/changes/archive
+         mv <change-dir> openspec/changes/archive/$(date +%Y-%m-%d)-<change-name>/
+         ```
+      5. If delta specs exist in the archived change's `specs/` subdirectory, copy them
+         into the main `openspec/specs/` directory (merge into source of truth)
+      6. Report what was archived and any specs that were synced
+
+      This completes the OpenSpec OPSX workflow cycle.
+    depends_on: [implement]
+    context: fresh

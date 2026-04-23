@@ -401,6 +401,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   let discord: DiscordAdapter | null = null;
   let slack: SlackAdapter | null = null;
   let slackBridge: SlackWorkflowBridge | null = null;
+  let telegram: TelegramAdapter | null = null;
 
   if (!opts.skipPlatformAdapters) {
     // Check that at least one platform is configured
@@ -933,7 +934,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   getLog().info({ port: server.port, hostname }, 'server_listening');
 
   // Initialize Telegram adapter (conditional, skipped in CLI serve mode)
-  let telegram: TelegramAdapter | null = null;
   if (!opts.skipPlatformAdapters && process.env.TELEGRAM_BOT_TOKEN) {
     const streamingMode = (process.env.TELEGRAM_STREAMING_MODE ?? 'stream') as 'stream' | 'batch';
     telegram = new TelegramAdapter(process.env.TELEGRAM_BOT_TOKEN, streamingMode);

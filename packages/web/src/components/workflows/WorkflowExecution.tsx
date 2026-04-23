@@ -206,7 +206,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
       };
     },
     refetchInterval: (query): number | false => {
-      const status = query.state.data?.workflowState.status;
+      const status = query.state.data?.workflowState?.status;
       if (status && isTerminal(status)) return false;
       return 3000;
     },

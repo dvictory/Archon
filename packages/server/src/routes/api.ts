@@ -1557,13 +1557,13 @@ const getHealthRoute = createRoute({
             .object({
               status: z.string(),
               adapter: z.string(),
+              activePlatforms: z.array(z.string()),
               concurrency: z.record(z.string(), z.unknown()),
               runningWorkflows: z.number(),
               version: z.string().optional(),
               is_docker: z.boolean(),
               is_wsl: z.boolean(),
               wsl_distro: z.string().optional(),
-              activePlatforms: z.array(z.string()).optional(),
               // Schema vintage (#2316) so a bug report can state which Archon build
               // created this database and which last applied schema to it. Omitted
               // when unrecorded or unreadable — health must answer regardless.

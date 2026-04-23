@@ -4134,6 +4134,7 @@ export interface components {
     HealthResponse: {
       status: string;
       adapter: string;
+      activePlatforms: string[];
       concurrency: {
         [key: string]: unknown;
       };
@@ -4142,7 +4143,6 @@ export interface components {
       is_docker: boolean;
       is_wsl: boolean;
       wsl_distro?: string;
-      activePlatforms?: string[];
       schema?: {
         createdAppVersion: string | null;
         appVersion: string;
