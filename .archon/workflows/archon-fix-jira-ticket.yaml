@@ -1,0 +1,692 @@
+name: archon-fix-jira-ticket
+description: |
+  Use when: User wants to FIX, RESOLVE, or IMPLEMENT a solution for a Jira ticket.
+  Triggers: "fix this ticket", "implement PROJ-123", "resolve this Jira", "fix it",
+            "fix ticket", "resolve ticket", "fix jira", "fix PROJ-123".
+  NOT for: GitHub issues (use archon-fix-github-issue),
+           questions about tickets, CI failures, PR reviews, general exploration.
+
+  Requires environment variables (any of the standard Atlassian Cloud auth vars):
+    JIRA_BASE_URL  (e.g. https://yourcompany.atlassian.net)
+    JIRA_EMAIL     (Atlassian account email)
+    JIRA_API_TOKEN (Atlassian API token — https://id.atlassian.com/manage-profile/security/api-tokens)
+
+  DAG workflow that:
+  1. Extracts the Jira ticket key (e.g. PROJ-123) from the user request
+  2. Fetches the ticket via the Jira REST API
+  3. Classifies the work (bug/feature/enhancement/etc)
+  4. Researches context (web research + codebase exploration via investigate/plan)
+  5. Routes to investigate (bugs) or plan (features) based on classification
+  6. Implements the fix/feature with validation
+  7. Creates a draft GitHub PR that references the Jira ticket
+  8. Runs smart review (always code review + CLAUDE.md check, conditional additional agents)
+  9. Aggressively self-fixes all findings (tests, docs, error handling)
+  10. Simplifies changed code (implements fixes directly, not just reports)
+  11. Final validation gate — lint, type-check, tests, format must ALL pass before push
+  12. Posts a completion comment back to the Jira ticket with PR link and follow-ups
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH & CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-ticket-key
+    prompt: |
+      Find the Jira ticket key for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - A Jira ticket key looks like `PROJECT-NUMBER` — uppercase letters, a hyphen, and digits (e.g. `PROJ-123`, `ABC-7`, `INFRA-2024`).
+      - If the message contains an explicit key, extract it.
+      - If the message contains a Jira URL (e.g. `https://acme.atlassian.net/browse/PROJ-123`), extract the key from the URL.
+      - If the message is ambiguous and no key is present, fail with a clear error — do NOT guess.
+
+      CRITICAL: Your final output must be ONLY the bare ticket key (uppercase, with hyphen) and nothing else. No quotes, no markdown, no explanation. Example correct output: PROJ-123
+    allowed_tools: []
+    model: haiku
+
+  - id: fetch-ticket
+    bash: |
+      set -e
+
+      TICKET_KEY=$(echo "$extract-ticket-key.output" | tr -d "'\"\`\n " | grep -oE '[A-Z][A-Z0-9_]+-[0-9]+' | head -1)
+      if [ -z "$TICKET_KEY" ]; then
+        echo "Failed to extract Jira ticket key from: $extract-ticket-key.output" >&2
+        exit 1
+      fi
+
+      : "${JIRA_BASE_URL:?JIRA_BASE_URL must be set (e.g. https://yourcompany.atlassian.net)}"
+      : "${JIRA_EMAIL:?JIRA_EMAIL must be set (Atlassian account email)}"
+      : "${JIRA_API_TOKEN:?JIRA_API_TOKEN must be set (Atlassian API token)}"
+
+      # Strip any trailing slash from the base URL
+      BASE_URL="${JIRA_BASE_URL%/}"
+      TICKET_URL="$BASE_URL/browse/$TICKET_KEY"
+
+      # Persist key + URL for downstream nodes
+      mkdir -p "$ARTIFACTS_DIR"
+      echo -n "$TICKET_KEY" > "$ARTIFACTS_DIR/.ticket-key"
+      echo -n "$TICKET_URL" > "$ARTIFACTS_DIR/.ticket-url"
+
+      RESPONSE=$(curl -sS --fail-with-body -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+        -H "Accept: application/json" \
+        "$BASE_URL/rest/api/3/issue/$TICKET_KEY?fields=summary,description,status,issuetype,priority,labels,components,reporter,assignee,comment")
+
+      # Save raw JSON for any later step that wants structured access
+      echo "$RESPONSE" > "$ARTIFACTS_DIR/jira-ticket.json"
+
+      # Build a human-readable rendering for downstream prompts
+      bun -e '
+        const data = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+        const f = data.fields ?? {};
+        const adfToText = (node) => {
+          if (!node) return "";
+          if (typeof node === "string") return node;
+          if (node.type === "text") return node.text ?? "";
+          if (node.type === "hardBreak") return "\n";
+          if (Array.isArray(node.content)) {
+            const inner = node.content.map(adfToText).join("");
+            if (node.type === "paragraph" || node.type === "heading") return inner + "\n\n";
+            if (node.type === "bulletList" || node.type === "orderedList") return inner + "\n";
+            if (node.type === "listItem") return "- " + inner;
+            if (node.type === "codeBlock") return "```\n" + inner + "\n```\n\n";
+            return inner;
+          }
+          return "";
+        };
+        const desc = adfToText(f.description) || "(no description)";
+        const lines = [];
+        lines.push(`# ${data.key}: ${f.summary ?? "(no summary)"}`);
+        lines.push("");
+        lines.push(`- URL: ${process.argv[2]}`);
+        lines.push(`- Type: ${f.issuetype?.name ?? "unknown"}`);
+        lines.push(`- Status: ${f.status?.name ?? "unknown"}`);
+        lines.push(`- Priority: ${f.priority?.name ?? "unset"}`);
+        lines.push(`- Reporter: ${f.reporter?.displayName ?? "unknown"}`);
+        lines.push(`- Assignee: ${f.assignee?.displayName ?? "unassigned"}`);
+        if (Array.isArray(f.labels) && f.labels.length) lines.push(`- Labels: ${f.labels.join(", ")}`);
+        if (Array.isArray(f.components) && f.components.length) lines.push(`- Components: ${f.components.map(c => c.name).join(", ")}`);
+        lines.push("");
+        lines.push("## Description");
+        lines.push("");
+        lines.push(desc.trim());
+        const comments = f.comment?.comments ?? [];
+        if (comments.length) {
+          lines.push("");
+          lines.push("## Comments");
+          for (const c of comments) {
+            const author = c.author?.displayName ?? "unknown";
+            const when = c.created ?? "";
+            const body = adfToText(c.body).trim();
+            lines.push("");
+            lines.push(`### ${author} — ${when}`);
+            lines.push("");
+            lines.push(body);
+          }
+        }
+        process.stdout.write(lines.join("\n"));
+      ' "$ARTIFACTS_DIR/jira-ticket.json" "$TICKET_URL" > "$ARTIFACTS_DIR/jira-ticket.md"
+
+      # Emit the markdown rendering as this node's output for downstream substitution
+      cat "$ARTIFACTS_DIR/jira-ticket.md"
+    depends_on: [extract-ticket-key]
+    timeout: 30000
+
+  - id: classify
+    prompt: |
+      You are a ticket classifier. Analyze the Jira ticket below and determine its type.
+
+      ## Ticket Content
+
+      $fetch-ticket.output
+
+      ## Classification Rules
+
+      | Type | Indicators |
+      |------|------------|
+      | bug | "broken", "error", "crash", "doesn't work", stack traces, regression, ticket type "Bug" |
+      | feature | "add", "new", "support", "would be nice", net-new capability, ticket type "Story" / "New Feature" |
+      | enhancement | "improve", "better", "update existing", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize", "restructure" |
+      | chore | "update deps", "upgrade", "maintenance", "CI/CD", ticket type "Task" with infra wording |
+      | documentation | "docs", "readme", "clarify", "examples" |
+
+      Use the ticket's `Type:` field as a strong signal but let the wording of summary and description override when they clearly indicate a different kind of work.
+
+      Provide reasoning for your classification.
+    depends_on: [fetch-ticket]
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH (web)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: INVESTIGATE (bugs) / PLAN (features)
+  # Inlined as prompts so the Jira ticket data is passed in directly,
+  # rather than relying on the GitHub-coupled archon-investigate-issue
+  # / archon-create-plan commands.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    prompt: |
+      You are investigating a bug reported in a Jira ticket. Produce a thorough
+      root-cause analysis and a remediation plan, then write it to
+      `$ARTIFACTS_DIR/investigation.md` so downstream steps can read it.
+
+      ## Jira Ticket
+
+      $fetch-ticket.output
+
+      ## Classification
+
+      $classify.output
+
+      ## Web Research (if available)
+
+      $web-research.output
+
+      ## Required Output File: $ARTIFACTS_DIR/investigation.md
+
+      Structure the file with these sections:
+
+      1. **Summary** — one-paragraph problem statement.
+      2. **Reproduction** — exact steps to reproduce, expected vs actual behavior.
+      3. **Root Cause Analysis** — code-level cause with file:line references.
+         Use Read/Grep/Glob freely to inspect the codebase. Do NOT modify code yet.
+      4. **Proposed Fix** — concrete plan: which files to change, what the change is,
+         and why it addresses the root cause.
+      5. **Risks & Side Effects** — what could break, which areas to test.
+      6. **Validation Plan** — tests to add/run, manual verification steps.
+      7. **Out of Scope** — anything we are deliberately NOT addressing in this fix.
+
+      Be specific. Cite file paths and line numbers. Do not speculate where you can verify.
+
+      Do NOT edit production code in this step — investigation only.
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+
+  - id: plan
+    prompt: |
+      You are creating an implementation plan for a Jira ticket that requests new
+      functionality, an enhancement, refactor, chore, or documentation work. Write
+      the plan to `$ARTIFACTS_DIR/plan.md` so downstream steps can read it.
+
+      ## Jira Ticket
+
+      $fetch-ticket.output
+
+      ## Classification
+
+      $classify.output
+
+      ## Web Research (if available)
+
+      $web-research.output
+
+      ## Required Output File: $ARTIFACTS_DIR/plan.md
+
+      Structure the file with these sections:
+
+      1. **Goal** — one-paragraph statement of what we will deliver.
+      2. **Context** — what's relevant in the codebase today (cite files/lines).
+         Use Read/Grep/Glob freely to inspect the codebase. Do NOT modify code yet.
+      3. **Approach** — step-by-step implementation plan, ordered. Each step lists
+         files to create/modify and the change in plain English.
+      4. **Acceptance Criteria** — how we know we're done (derive from the ticket).
+      5. **Test Plan** — unit/integration tests to add, manual verification steps.
+      6. **Risks & Open Questions** — known unknowns, areas that could break.
+      7. **Out of Scope** — anything we are deliberately NOT addressing.
+
+      Be specific. Cite file paths and line numbers. Prefer the smallest viable change
+      that satisfies the ticket.
+
+      Do NOT edit production code in this step — planning only.
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+
+  # Bridge: ensure investigation.md exists for the implement step
+  # archon-fix-issue reads from $ARTIFACTS_DIR/investigation.md
+  # The plan node writes to $ARTIFACTS_DIR/plan.md
+  # This node copies plan.md → investigation.md when the plan path was taken
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md to investigation.md for implement step"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md exists from investigate step"
+      else
+        echo "WARNING: No investigation.md or plan.md found — implement may fail"
+      fi
+    depends_on: [investigate, plan]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: IMPLEMENT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    command: archon-fix-issue
+    depends_on: [bridge-artifacts]
+    context: fresh
+    model: claude-opus-4-6[1m]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: VALIDATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [implement]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: CREATE DRAFT PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a draft pull request for the current branch. The PR must reference the
+      Jira ticket so it shows up in the Jira/GitHub integration.
+
+      ## Context
+
+      - **Jira ticket**: read the key from `$ARTIFACTS_DIR/.ticket-key` (e.g. `PROJ-123`)
+      - **Jira ticket URL**: read from `$ARTIFACTS_DIR/.ticket-url`
+      - **Classification**: $classify.output
+      - **Ticket title**: $classify.output.title
+
+      ## Instructions
+
+      1. Read the ticket key and URL:
+         ```bash
+         TICKET_KEY=$(cat "$ARTIFACTS_DIR/.ticket-key")
+         TICKET_URL=$(cat "$ARTIFACTS_DIR/.ticket-url")
+         ```
+      2. Check git status — ensure all changes are committed. If uncommitted changes exist, stage and commit them.
+      3. Push the branch: `git push -u origin HEAD`
+      4. Read implementation artifacts from `$ARTIFACTS_DIR/` for context:
+         - `$ARTIFACTS_DIR/jira-ticket.md`
+         - `$ARTIFACTS_DIR/investigation.md` or `$ARTIFACTS_DIR/plan.md`
+         - `$ARTIFACTS_DIR/implementation.md`
+         - `$ARTIFACTS_DIR/validation.md`
+      5. Check if a PR already exists for this branch: `gh pr list --head $(git branch --show-current)`
+         - If a PR exists, skip creation and capture its number.
+      6. Look for the project's PR template at `.github/pull_request_template.md`,
+         `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`.
+         Read whichever one exists.
+      7. Create a DRAFT PR: `gh pr create --draft --base $BASE_BRANCH`
+         - **Title**: prefix with the ticket key in brackets, then a concise imperative
+           summary under 70 chars total. Example: `[PROJ-123] Fix expired session retry`
+         - **Body**: if a PR template was found, fill in **every section** with details
+           from the artifacts. Don't skip sections or leave placeholders.
+           If no template, write a body with summary, changes, and validation evidence.
+         - **Always** include a `Jira:` line linking to the ticket URL near the top of the body,
+           e.g. `Jira: [PROJ-123](https://acme.atlassian.net/browse/PROJ-123)`. GitHub does
+           not auto-close Jira tickets the way it closes its own issues, so do NOT use
+           `Fixes #...` / `Closes #...` for the Jira key — just link to it.
+      8. Capture PR identifiers:
+         ```bash
+         PR_NUMBER=$(gh pr view --json number -q '.number')
+         echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+         PR_URL=$(gh pr view --json url -q '.url')
+         echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+         ```
+    depends_on: [validate]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: REVIEW
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [create-pr]
+    context: fresh
+
+  - id: review-classify
+    prompt: |
+      You are a PR review classifier. Analyze the PR scope and determine
+      which review agents should run.
+
+      ## PR Scope
+
+      $review-scope.output
+
+      ## Rules
+
+      - **Code review**: ALWAYS run. This is mandatory for every PR. It also checks
+        the PR against CLAUDE.md rules and project conventions.
+      - **Error handling**: Run if the diff touches code with try/catch, error handling,
+        async/await, or adds new failure paths.
+      - **Test coverage**: Run if the diff touches source code (not just tests, docs, or config).
+      - **Comment quality**: Run if the diff adds or modifies comments, docstrings, JSDoc,
+        or significant documentation within code files.
+      - **Docs impact**: Run if the diff adds/removes/renames public APIs, commands, CLI flags,
+        environment variables, or user-facing features.
+
+      Provide your reasoning for each decision.
+    depends_on: [review-scope]
+    model: haiku
+    allowed_tools: []
+    context: fresh
+    output_format:
+      type: object
+      properties:
+        run_code_review:
+          type: string
+          enum: ["true", "false"]
+        run_error_handling:
+          type: string
+          enum: ["true", "false"]
+        run_test_coverage:
+          type: string
+          enum: ["true", "false"]
+        run_comment_quality:
+          type: string
+          enum: ["true", "false"]
+        run_docs_impact:
+          type: string
+          enum: ["true", "false"]
+        reasoning:
+          type: string
+      required:
+        - run_code_review
+        - run_error_handling
+        - run_test_coverage
+        - run_comment_quality
+        - run_docs_impact
+        - reasoning
+
+  # Code review always runs — mandatory
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [review-classify]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_error_handling == 'true'"
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_test_coverage == 'true'"
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_comment_quality == 'true'"
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_docs_impact == 'true'"
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 8: SYNTHESIZE + SELF-FIX
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh
+
+  - id: self-fix
+    command: archon-self-fix-all
+    depends_on: [synthesize]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 9: SIMPLIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 10: FINAL VALIDATION GATE
+  # Ensures lint, type-check, and tests all pass before pushing.
+  # No code reaches GitHub until this gate is green.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: final-validate
+    prompt: |
+      You are a final validation gate. Your job is to ensure lint, type-check,
+      and tests ALL pass before any code is pushed to GitHub.
+
+      **CRITICAL**: Do NOT push code until every check passes. Fix issues in place.
+
+      ## Step 0: Detect Monorepo Tool
+
+      ```bash
+      if [ -f nx.json ]; then echo "nx"; elif [ -f turbo.json ]; then echo "turbo"; else echo "standard"; fi
+      ```
+
+      Use the detected tool for type-check and test commands:
+      - **nx**: `bun nx affected -t typecheck` / `bun nx affected -t test`
+      - **turbo/standard**: `bun run type-check` / `bun run test`
+      - **Lint**: Always `bun run lint` (root-level)
+
+      ## Step 1: Run Lint
+
+      ```bash
+      bun run lint
+      ```
+
+      If it fails:
+      1. Run `bun run lint:fix`
+      2. Re-run `bun run lint`
+      3. If still failing, manually fix remaining issues
+      4. Repeat until `bun run lint` exits 0
+
+      ## Step 2: Run Type Check
+
+      ```bash
+      # Monorepo-aware
+      if [ -f nx.json ]; then bun nx affected -t typecheck; else bun run type-check; fi
+      ```
+
+      If it fails:
+      1. Read the error output
+      2. Fix type errors in the reported files
+      3. Re-run until passing
+
+      ## Step 3: Run Tests
+
+      ```bash
+      # Monorepo-aware
+      if [ -f nx.json ]; then bun nx affected -t test; else bun run test; fi
+      ```
+
+      If tests fail:
+      1. Identify which tests failed
+      2. Determine if it's an implementation bug or test bug
+      3. Fix the root cause
+      4. Re-run until all tests pass
+
+      ## Step 4: Run Format Check
+
+      ```bash
+      bun run format:check
+      ```
+
+      If it fails:
+      1. Run `bun run format`
+      2. Verify with `bun run format:check`
+
+      ## Step 5: Commit and Push (only after ALL checks pass)
+
+      Only after ALL four checks pass:
+
+      ```bash
+      git status --porcelain
+      ```
+
+      If there are uncommitted changes from fixes:
+      ```bash
+      git add {specific files that were fixed}
+      git commit -m "chore: fix lint, type-check, and test issues"
+      ```
+
+      Then push:
+      ```bash
+      git push origin HEAD
+      ```
+
+      If push fails due to divergence:
+      ```bash
+      git pull --rebase origin $(git branch --show-current)
+      git push origin HEAD
+      ```
+
+      ## Output
+
+      Report the final status:
+
+      ```
+      ## Final Validation Gate
+
+      | Check | Status |
+      |-------|--------|
+      | Lint | PASS/FAIL |
+      | Type check | PASS/FAIL |
+      | Tests | PASS/FAIL |
+      | Format | PASS/FAIL |
+
+      Pushed: YES/NO
+      ```
+    depends_on: [simplify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 11: REPORT BACK TO JIRA
+  # Posts a completion comment on the original Jira ticket via the
+  # Atlassian REST API. Inlined (instead of using the GitHub-only
+  # archon-issue-completion-report command) because the Jira comment
+  # API uses Atlassian Document Format, not Markdown.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    prompt: |
+      You are posting a completion comment back to the originating Jira ticket.
+
+      ## Sources of truth (read these before composing the comment)
+
+      ```bash
+      TICKET_KEY=$(cat "$ARTIFACTS_DIR/.ticket-key")
+      TICKET_URL=$(cat "$ARTIFACTS_DIR/.ticket-url")
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null || echo "unknown")
+      PR_URL=$(cat "$ARTIFACTS_DIR/.pr-url" 2>/dev/null || echo "unknown")
+      ```
+
+      Read whichever of these artifacts exist:
+      - `$ARTIFACTS_DIR/jira-ticket.md`
+      - `$ARTIFACTS_DIR/investigation.md` or `$ARTIFACTS_DIR/plan.md`
+      - `$ARTIFACTS_DIR/implementation.md`
+      - `$ARTIFACTS_DIR/validation.md`
+      - `$ARTIFACTS_DIR/review/consolidated-review.md`
+      - `$ARTIFACTS_DIR/review/fix-report.md`
+
+      ## Compose the report
+
+      Write a markdown report to `$ARTIFACTS_DIR/completion-report.md` with these sections:
+
+      1. **Summary** — one-paragraph plain-English description of what shipped.
+      2. **Pull Request** — link with PR number and URL.
+      3. **What was done** — bullet list of changes (files, behavior).
+      4. **Validation** — what was tested and the result (lint, type-check, tests, format).
+      5. **Review findings** — CRITICAL/HIGH issues found and how they were resolved (or
+         why they remain).
+      6. **Not addressed** — anything from the ticket explicitly left for follow-up,
+         with a one-line reason.
+      7. **Suggested follow-ups** — concrete next tickets, if any.
+
+      ## Post the comment to Jira
+
+      The Jira REST API requires Atlassian Document Format (ADF) for comment bodies.
+      Construct ADF from the markdown report and POST it. Use this exact pattern:
+
+      ```bash
+      BASE_URL="${JIRA_BASE_URL%/}"
+
+      # Build an ADF body from the markdown report. Keep it simple: one paragraph per
+      # markdown line, preserving headings as bold paragraphs and bullets as a list.
+      bun -e '
+        const fs = require("fs");
+        const md = fs.readFileSync(process.argv[1], "utf8");
+        const content = [];
+        for (const rawLine of md.split(/\r?\n/)) {
+          const line = rawLine.trimEnd();
+          if (!line.trim()) continue;
+          if (line.startsWith("# ")) {
+            content.push({ type: "heading", attrs: { level: 1 }, content: [{ type: "text", text: line.slice(2) }] });
+          } else if (line.startsWith("## ")) {
+            content.push({ type: "heading", attrs: { level: 2 }, content: [{ type: "text", text: line.slice(3) }] });
+          } else if (line.startsWith("### ")) {
+            content.push({ type: "heading", attrs: { level: 3 }, content: [{ type: "text", text: line.slice(4) }] });
+          } else if (line.startsWith("- ") || line.startsWith("* ")) {
+            const last = content[content.length - 1];
+            const item = { type: "listItem", content: [{ type: "paragraph", content: [{ type: "text", text: line.slice(2) }] }] };
+            if (last && last.type === "bulletList") last.content.push(item);
+            else content.push({ type: "bulletList", content: [item] });
+          } else {
+            content.push({ type: "paragraph", content: [{ type: "text", text: line }] });
+          }
+        }
+        const body = { body: { version: 1, type: "doc", content } };
+        process.stdout.write(JSON.stringify(body));
+      ' "$ARTIFACTS_DIR/completion-report.md" > "$ARTIFACTS_DIR/.jira-comment.json"
+
+      curl -sS --fail-with-body -X POST \
+        -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        --data @"$ARTIFACTS_DIR/.jira-comment.json" \
+        "$BASE_URL/rest/api/3/issue/$TICKET_KEY/comment"
+      ```
+
+      If the POST fails (non-2xx), surface the error in your final response. Do NOT
+      silently swallow failures — the user needs to know if the Jira comment didn't land.
+
+      ## Final response to the user
+
+      Print a short markdown summary to stdout:
+      - Ticket key + URL
+      - PR number + URL
+      - Whether the Jira comment was posted successfully
+      - Top 3 follow-up suggestions (if any)
+    depends_on: [final-validate]
+    context: fresh
