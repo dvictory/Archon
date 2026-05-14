@@ -182,6 +182,53 @@ git add -A
 git status
 ```
 
+### 4.1.1 Pre-Push Lint Guardrail
+
+Before committing, run `bun run lint:fix` so any lint violations introduced by the review fixes are corrected in the same commit (no separate "chore: lint" commit needed here, and no surprise CI failure after push).
+
+```bash
+bun run lint:fix
+bun run lint
+```
+
+If `bun run lint` still fails after the autofix, fix the remaining violations by hand following the same rules as `archon-lint-fix.md` (no rule suppression, prefer real fixes over `eslint-disable`). Re-run until lint exits 0.
+
+After lint passes, re-stage any newly modified files:
+
+```bash
+git add -A
+```
+
+If lint cannot be made to pass, **do not push**. Mark the run as `BLOCKED` in the report below and stop.
+
+### 4.1.2 Pre-Push Type-Check + Test Guardrail
+
+Phase 3 already validated type-check and tests, but the lint autofix in 4.1.1 may have modified files since then. Re-verify both before committing so any breakage gets folded into the same review-fix commit (no separate "fix: types" commit, no surprise CI failure after push).
+
+```bash
+# Type check (monorepo-aware)
+if [ -f nx.json ]; then bun nx affected -t typecheck; else bun run type-check; fi
+
+# Tests (monorepo-aware)
+if [ -f nx.json ]; then bun nx affected -t test; else bun run test; fi
+```
+
+If either fails, apply best-effort fixes following the same discipline as `archon-verify-types-tests.md`:
+
+- **Default assumption**: the implementation is wrong, the test is right. Bias toward fixing implementation, not tests.
+- **Classify each failure** before fixing: implementation bug / test bug / type drift / flaky.
+- **Document every test-file modification** in the fix report (file:line, what changed, one-sentence justification).
+- **No** `@ts-ignore`, `// @ts-expect-error`, blanket `any` casts, `test.skip`, weakened assertions, or deleted tests to force green. Suppression is detection evasion, not a fix.
+- **Cap**: up to 3 attempts per check, 6 total. If you can't reach green within that budget, **do not push**. Mark `BLOCKED` in the report and stop.
+
+After fixes, re-stage:
+
+```bash
+git add -A
+```
+
+Re-run both checks once more. They must exit 0 before proceeding to 4.2.
+
 ### 4.2 Commit
 
 ```bash

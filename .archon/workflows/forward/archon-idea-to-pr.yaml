@@ -10,10 +10,10 @@ description: |
   3. Verify plan research is still valid
   4. Implement all tasks with type-checking
   5. Run full validation suite
-  6. Create PR with template, mark ready
-  7. Comprehensive code review (5 parallel agents with scope limit awareness)
-  8. Synthesize and fix review findings
-  9. CodeRabbit AI review with auto-fix of findings
+  6. CodeRabbit AI review against local branch with auto-fix (pre-push)
+  7. Create PR with template, mark ready (first push to remote)
+  8. Comprehensive code review (5 parallel agents with scope limit awareness)
+  9. Synthesize and fix review findings
   10. Final summary with decision matrix -> GitHub comment + follow-up recommendations
 
   NOT for: Executing existing plans (use archon-plan-to-pr), quick fixes, standalone reviews.
@@ -53,7 +53,7 @@ nodes:
     command: archon-implement-tasks
     depends_on: [confirm-plan]
     context: fresh
-    model: claude-opus-4-6[1m]
+    model: claude-opus-4-7[1m]
 
   # ═══════════════════════════════════════════════════════════════════
   # PHASE 4: VALIDATE
@@ -65,16 +65,47 @@ nodes:
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════════
-  # PHASE 5: FINALIZE PR
+  # PHASE 5: CODERABBIT REVIEW (pre-push, local branch vs base)
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: coderabbit-review
+    command: archon-coderabbit-review
+    depends_on: [validate]
+    context: fresh
+
+  # Hard gate: types + tests must pass after CodeRabbit's fixes.
+  - id: verify-after-coderabbit
+    command: archon-verify-types-tests
+    depends_on: [coderabbit-review]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 5.5: LINT FIX (pre-push guardrail before first push)
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: lint-fix-prepush
+    command: archon-lint-fix
+    depends_on: [verify-after-coderabbit]
+    context: fresh
+
+  # Hard gate: types + tests must pass after lint autofix. This is the
+  # last gate before the first remote push (finalize-pr).
+  - id: verify-prepush
+    command: archon-verify-types-tests
+    depends_on: [lint-fix-prepush]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 6: FINALIZE PR (first push + open PR)
   # ═══════════════════════════════════════════════════════════════════
 
   - id: finalize-pr
     command: archon-finalize-pr
-    depends_on: [validate]
+    depends_on: [verify-prepush]
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════════
-  # PHASE 6: CODE REVIEW
+  # PHASE 7: CODE REVIEW
   # ═══════════════════════════════════════════════════════════════════
 
   - id: review-scope
@@ -115,11 +146,11 @@ nodes:
   - id: synthesize
     command: archon-synthesize-review
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
-    trigger_rule: one_success
+    trigger_rule: all_done
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════════
-  # PHASE 7: FIX REVIEW ISSUES
+  # PHASE 8: FIX REVIEW ISSUES
   # ═══════════════════════════════════════════════════════════════════
 
   - id: implement-fixes
@@ -127,12 +158,12 @@ nodes:
     depends_on: [synthesize]
     context: fresh
 
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 8: CODERABBIT REVIEW
-  # ═══════════════════════════════════════════════════════════════════
-
-  - id: coderabbit-review
-    command: archon-coderabbit-review
+  # Hard gate: types + tests must pass after review fixes.
+  # implement-fixes pushes internally, so this gate runs post-push — its
+  # value is surfacing whether the pushed state is actually green so the
+  # workflow summary can report it clearly.
+  - id: verify-after-fixes
+    command: archon-verify-types-tests
     depends_on: [implement-fixes]
     context: fresh
 
@@ -142,5 +173,5 @@ nodes:
 
   - id: workflow-summary
     command: archon-workflow-summary
-    depends_on: [coderabbit-review]
+    depends_on: [verify-after-fixes]
     context: fresh

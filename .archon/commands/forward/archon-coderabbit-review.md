@@ -1,15 +1,15 @@
 ---
-description: Run CodeRabbit AI code review against PR branch, fix findings, validate, and push
-argument-hint: (none - reads PR context from workflow artifacts)
+description: Run CodeRabbit AI review against the local feature branch (pre-push), fix findings, validate, and commit locally. No push, no PR.
+argument-hint: (none - operates on the current local branch vs $BASE_BRANCH)
 ---
 
-# CodeRabbit Review & Fix
+# CodeRabbit Review & Fix (Pre-Push)
 
 ---
 
 ## IMPORTANT: Output Behavior
 
-**Your output will be posted as a GitHub comment.** Keep working output minimal:
+This step runs **before any code is pushed to the remote** and before a PR exists. There is nowhere to post a GitHub comment yet. Keep working output minimal:
 - Do NOT narrate each step
 - Do NOT output verbose progress updates
 - Only output the final structured report at the end
@@ -19,59 +19,62 @@ argument-hint: (none - reads PR context from workflow artifacts)
 
 ## Your Mission
 
-Run the CodeRabbit AI code review skill against the current PR changes, fix all actionable findings, validate, commit, push, and report results. This serves as an additional quality gate after the built-in review agents have already run and their fixes have been applied.
+Run the CodeRabbit AI code review skill against the **local feature branch's diff vs the base branch**, fix all actionable findings, validate, and commit fixes **locally only**. This is a pre-push quality gate: the goal is to keep CodeRabbit churn out of the eventual PR history.
 
 **Output artifact**: `$ARTIFACTS_DIR/review/coderabbit-report.md`
-**Git action**: Commit AND push fixes to the PR branch
-**GitHub action**: Post CodeRabbit fix report as a comment on the PR
+**Git action**: Commit fixes locally on the current branch. **Do NOT push. Do NOT open or comment on a PR.**
 
 ---
 
-## Phase 1: LOAD - Get PR Context
+## Phase 1: LOAD - Confirm Local Branch Context
 
-### 1.1 Get PR Number and Branch
+### 1.1 Identify Current Branch and Base
 
 ```bash
-PR_NUMBER=$(cat $ARTIFACTS_DIR/.pr-number)
-HEAD_BRANCH=$(gh pr view $PR_NUMBER --json headRefName,baseRefName --jq '.headRefName + " " + .baseRefName')
-echo "PR: $PR_NUMBER, Branch info: $HEAD_BRANCH"
+HEAD_BRANCH=$(git branch --show-current)
+BASE_BRANCH="$BASE_BRANCH"
+echo "Local branch: $HEAD_BRANCH"
+echo "Base branch: $BASE_BRANCH"
 ```
 
-Extract HEAD_BRANCH and BASE_BRANCH from the output.
+`$BASE_BRANCH` is substituted by the workflow engine. If empty, fall back to `git symbolic-ref refs/remotes/origin/HEAD --short | sed 's@^origin/@@'` and stop with an error if that also fails.
 
-### 1.2 Checkout PR Branch
-
-```bash
-git fetch origin $HEAD_BRANCH
-git checkout $HEAD_BRANCH
-git pull origin $HEAD_BRANCH
-```
-
-Verify:
+### 1.2 Verify Working Tree State
 
 ```bash
-git branch --show-current
 git status --porcelain
 ```
 
+The working tree should be clean (everything committed in earlier phases). If there are uncommitted changes, stop and report — the earlier `implement-tasks` / `validate` phases should have left a clean tree.
+
+### 1.3 Confirm Diff vs Base
+
+```bash
+git fetch origin $BASE_BRANCH 2>/dev/null || true
+git log --oneline origin/$BASE_BRANCH..HEAD 2>/dev/null || git log --oneline $BASE_BRANCH..HEAD
+```
+
+There must be at least one commit on the feature branch beyond base. If the diff is empty, write a `NO_FINDINGS` report and exit.
+
 **PHASE_1_CHECKPOINT:**
-- [ ] PR number identified
-- [ ] On the correct PR branch
+- [ ] Branch identified
 - [ ] Base branch identified
+- [ ] Working tree clean
+- [ ] Non-empty diff vs base confirmed (or exit with NO_FINDINGS)
 
 ---
 
 ## Phase 2: REVIEW - Run CodeRabbit
 
-### 2.1 Run CodeRabbit Review
+### 2.1 Run CodeRabbit Against Local Diff
 
-Invoke the CodeRabbit skill to review all committed changes against the base branch:
+Invoke the CodeRabbit skill against the committed feature-branch diff vs base:
 
 ```
-/coderabbit:review committed --base $BASE_BRANCH
+/coderabbit:review --base $BASE_BRANCH
 ```
 
-This will analyze the diff between the base branch and the current PR branch, returning structured findings with file locations and severity levels.
+This analyzes the local commits on the feature branch against `$BASE_BRANCH` without requiring a pushed PR. It returns structured findings with file locations and severity levels.
 
 ### 2.2 Collect Findings
 
@@ -100,7 +103,6 @@ For each CodeRabbit finding, decide: **FIX** or **SKIP**.
 - The finding recommends speculative abstractions or refactoring beyond PR scope
 - It suggests adding validation for inputs that cannot be invalid in context
 - It recommends architectural changes outside the PR's concern
-- It duplicates an issue already addressed by the earlier review agents
 
 For each skipped finding, document **the specific reason**.
 
@@ -163,7 +165,7 @@ All must pass. If something fails after a fix:
 
 ---
 
-## Phase 6: COMMIT AND PUSH
+## Phase 6: COMMIT LOCALLY (NO PUSH)
 
 ### 6.1 Stage and Commit
 
@@ -172,28 +174,19 @@ Only commit if there are actual changes to commit. If no fixes were applied (all
 ```bash
 git add {specific files}
 git status
-git commit -m "fix: address CodeRabbit review findings
+git commit -m "fix: address CodeRabbit pre-push review findings
 
 $(echo "Fixed:"; echo "- {brief list}")
 $(echo ""; echo "Skipped:"; echo "- {brief list if any}")"
 ```
 
-### 6.2 Push
+### 6.2 Do NOT Push
 
-```bash
-git push origin $HEAD_BRANCH
-```
-
-If push fails:
-
-```bash
-git pull --rebase origin $HEAD_BRANCH
-git push origin $HEAD_BRANCH
-```
+This step runs **before** the PR exists. The next workflow phase (`finalize-pr`) is responsible for the first push and `gh pr create`. Do not run `git push` here.
 
 **PHASE_6_CHECKPOINT:**
-- [ ] Changes committed (or no changes needed)
-- [ ] Pushed to PR branch (or nothing to push)
+- [ ] Changes committed locally (or no changes needed)
+- [ ] No push attempted
 
 ---
 
@@ -202,11 +195,12 @@ git push origin $HEAD_BRANCH
 Write to `$ARTIFACTS_DIR/review/coderabbit-report.md`:
 
 ```markdown
-# CodeRabbit Review Report: PR #{number}
+# CodeRabbit Pre-Push Review Report
 
 **Date**: {ISO timestamp}
 **Status**: COMPLETE | PARTIAL | NO_FINDINGS
 **Branch**: {HEAD_BRANCH}
+**Base**: {BASE_BRANCH}
 **Commit**: {commit hash or "no changes"}
 
 ---
@@ -269,66 +263,15 @@ Write to `$ARTIFACTS_DIR/review/coderabbit-report.md`:
 
 ---
 
-## Phase 8: POST - GitHub Comment
-
-Post the results as a PR comment:
-
-```bash
-gh pr comment $PR_NUMBER --body "$(cat <<'EOF'
-## CodeRabbit Review Report
-
-**Status**: {COMPLETE | PARTIAL | NO_FINDINGS}
-**Pushed**: {yes/no changes}
-
----
-
-### Findings
-
-| Total | Fixed | Skipped | Blocked |
-|-------|-------|---------|---------|
-| {N}   | {N}   | {N}     | {N}     |
-
-{If fixes applied:}
-### Fixes Applied
-
-| Finding | Location |
-|---------|----------|
-| {title} | `file:line` |
-
-{If skipped:}
-### Skipped
-
-| Finding | Reason |
-|---------|--------|
-| {title} | {reason} |
-
----
-
-### Validation
-
-Type check | Lint | Tests
-
----
-
-*CodeRabbit review by Archon*
-EOF
-)"
-```
-
-**PHASE_8_CHECKPOINT:**
-- [ ] GitHub comment posted
-
----
-
-## Phase 9: OUTPUT - Final Summary
+## Phase 8: OUTPUT - Final Summary
 
 Output only this:
 
 ```
-## CodeRabbit Review Complete
+## CodeRabbit Pre-Push Review Complete
 
-**PR**: #{number}
 **Branch**: {HEAD_BRANCH}
+**Base**: {BASE_BRANCH}
 **Status**: {COMPLETE | PARTIAL | NO_FINDINGS}
 
 Found: {n}
@@ -337,10 +280,12 @@ Skipped: {n}
 Blocked: {n}
 
 Validation: All checks pass
-Pushed: {yes/no changes}
+Pushed: no (intentional — pre-push gate)
 
 Report: $ARTIFACTS_DIR/review/coderabbit-report.md
 ```
+
+The `workflow-summary` phase at the end of the workflow surfaces this artifact in the final PR comment.
 
 ---
 
@@ -354,25 +299,24 @@ CodeRabbit skill not available. Skipping CodeRabbit review.
 Write an artifact noting the skip and continue without failing the workflow.
 
 ### No findings
-This is a success case - CodeRabbit found no issues. Write the report with NO_FINDINGS status and post a brief GitHub comment confirming the clean review.
+This is a success case — CodeRabbit found no issues. Write the report with `NO_FINDINGS` status and exit. No commit needed.
 
 ### Type check / tests fail after fix
 1. Review the error
 2. Adjust or revert the fix
 3. If still failing, mark BLOCKED
 
-### Push fails
-1. `git pull --rebase origin $HEAD_BRANCH`
-2. Resolve conflicts if any
-3. Push again
+### Empty diff vs base
+Should not happen if `implement-tasks` produced commits, but if so: write `NO_FINDINGS` report and exit cleanly.
 
 ---
 
 ## Success Criteria
 
-- **ON_CORRECT_BRANCH**: Working on PR's head branch
+- **ON_LOCAL_BRANCH**: Working on the feature branch with a non-empty diff vs `$BASE_BRANCH`
 - **REVIEW_RAN**: CodeRabbit review executed (or gracefully skipped if unavailable)
 - **ALL_FINDINGS_ADDRESSED**: Every finding is fixed, skipped (with reason), or blocked (with reason)
 - **VALIDATION_PASSED**: Type check, lint, and tests all pass
-- **COMMITTED_AND_PUSHED**: Changes committed and pushed (if any fixes applied)
-- **REPORTED**: Report artifact written and GitHub comment posted
+- **COMMITTED_LOCALLY**: Fixes committed on the local branch (if any fixes applied)
+- **NOT_PUSHED**: No `git push` executed; no PR comment posted
+- **REPORTED**: Report artifact written to `$ARTIFACTS_DIR/review/coderabbit-report.md`
