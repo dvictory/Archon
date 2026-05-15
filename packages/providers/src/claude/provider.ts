@@ -44,6 +44,7 @@ import type {
   TokenUsage,
   ProviderCapabilities,
   NodeConfig,
+  SystemPromptInput,
 } from '../types';
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
@@ -93,6 +94,25 @@ interface ContentBlock {
   name?: string;
   input?: Record<string, unknown>;
   id?: string;
+}
+
+/**
+ * Coerce the contract `SystemPromptInput` (`string | string[] | SystemPromptPreset`)
+ * to the narrower shape the Claude Agent SDK accepts (`string | { type: 'preset';
+ * preset: 'claude_code'; append?: string }`).
+ *
+ * - `string` → unchanged
+ * - `string[]` → joined with blank-line separators (Pi accepts arrays natively;
+ *   Claude does not, so we flatten before handing off to the SDK)
+ * - `SystemPromptPreset` → strip non-SDK fields (e.g. `excludeDynamicSections`),
+ *   omit `append` entirely when undefined to avoid an explicit-undefined property
+ */
+function toClaudeSystemPrompt(input: SystemPromptInput): Options['systemPrompt'] {
+  if (typeof input === 'string') return input;
+  if (Array.isArray(input)) return input.join('\n\n');
+  return input.append !== undefined
+    ? { type: input.type, preset: input.preset, append: input.append }
+    : { type: input.type, preset: input.preset };
 }
 
 function normalizeClaudeUsage(usage?: {
@@ -700,7 +720,7 @@ async function applyNodeConfig(
 
   // systemPrompt from nodeConfig
   if (nodeConfig.systemPrompt !== undefined) {
-    options.systemPrompt = nodeConfig.systemPrompt;
+    options.systemPrompt = toClaudeSystemPrompt(nodeConfig.systemPrompt);
   }
 
   // fallbackModel from nodeConfig
@@ -836,7 +856,10 @@ function buildBaseClaudeOptions(
       : {}),
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
-    systemPrompt: requestOptions?.systemPrompt ?? { type: 'preset', preset: 'claude_code' },
+    systemPrompt:
+      requestOptions?.systemPrompt !== undefined
+        ? toClaudeSystemPrompt(requestOptions.systemPrompt)
+        : { type: 'preset', preset: 'claude_code' },
     // Per-node override wins over the assistant-level default; the final
     // fallback stays ['project', 'user'] (the SDK-loading default Archon ships).
     settingSources,
