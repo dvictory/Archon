@@ -213,6 +213,57 @@ The coding agent handles workflow selection, branch naming, and worktree isolati
 
 > **Important:** Always run Claude Code from your target repo, not from the Archon repo. The setup wizard copies the Archon skill into your project so it works from there.
 
+## Forward Workflows & Commands (Multi-Machine Setup)
+
+This fork ships custom workflows in `.archon/workflows/forward/` and commands in `.archon/commands/forward/`. To make them available globally on a new machine — usable from any project, not just inside the Archon repo — symlink them into `~/.archon/`.
+
+Archon auto-discovers home-scoped (`~/.archon/`) workflows and commands one level deep, so a `forward/` subfolder symlinked there is loaded for every project on that machine.
+
+### One-time setup on a new computer
+
+After cloning this repo:
+
+```bash
+cd /path/to/this/Archon
+
+# Ensure the home-scoped directories exist
+mkdir -p ~/.archon/workflows ~/.archon/commands
+
+# Symlink the forward subfolders into ~/.archon/
+# -s symbolic, -n don't follow existing symlink dirs, -f replace if present
+ln -snf "$(pwd)/.archon/workflows/forward" ~/.archon/workflows/forward
+ln -snf "$(pwd)/.archon/commands/forward"  ~/.archon/commands/forward
+```
+
+Verify the symlinks resolve and the workflows are discovered:
+
+```bash
+ls -la ~/.archon/workflows/forward ~/.archon/commands/forward
+archon workflow list | grep -E "simple-update|archon-idea-to-pr"
+```
+
+### Updating
+
+Because these are symlinks, a `git pull` in this repo instantly updates every machine that's symlinked to this checkout — no copy step, no rerun.
+
+### Removing
+
+```bash
+rm ~/.archon/workflows/forward ~/.archon/commands/forward
+```
+
+This removes only the symlinks; the source files in this repo are untouched.
+
+### Windows
+
+PowerShell equivalent (run from the Archon repo root, requires Developer Mode or an elevated shell):
+
+```powershell
+New-Item -ItemType Directory -Force -Path "$HOME\.archon\workflows", "$HOME\.archon\commands" | Out-Null
+New-Item -ItemType SymbolicLink -Force -Path "$HOME\.archon\workflows\forward" -Target "$PWD\.archon\workflows\forward"
+New-Item -ItemType SymbolicLink -Force -Path "$HOME\.archon\commands\forward"  -Target "$PWD\.archon\commands\forward"
+```
+
 ## Web UI
 
 Archon includes a web dashboard for chatting with your coding agent, running workflows, and monitoring activity. Binary installs: run `archon serve` to download and start the web UI in one step. From source: ask your coding agent to run the frontend from the Archon repo, or run `bun run dev` from the repo root yourself.

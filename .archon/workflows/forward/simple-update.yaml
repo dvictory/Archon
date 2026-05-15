@@ -1,0 +1,118 @@
+name: simple-update
+description: |
+  Use when: You have a small fix or small change to make to the codebase.
+  Triggers: "simple update", "small fix", "small change", "quick update", "minor fix".
+  Input: Description of the change in natural language.
+  Output: PR ready for review with tests, CodeRabbit clean, lint/types clean.
+
+  Full workflow:
+  1. Plan the change with tests included in the plan
+  2. Execute the plan (create tests + code)
+  3. Validate the change
+  4. Run the test suite, fix failures until it passes
+  5. Run CodeRabbit review and fix any findings
+  6. Run lint + type-check, fix until they pass
+  7. Create a PR and push
+
+  NOT for: Large features (use archon-idea-to-pr), bug investigations,
+          standalone PR reviews, plan-only runs.
+
+provider: claude
+model: claude-opus-4-7
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 1: PLAN (with tests)
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: create-plan
+    command: archon-create-plan
+    context: fresh
+
+  - id: plan-setup
+    command: archon-plan-setup
+    depends_on: [create-plan]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 2: IMPLEMENT (tests + code together)
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: implement-tasks
+    command: archon-implement-tasks
+    depends_on: [plan-setup]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 3: VALIDATE
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [implement-tasks]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 4: TEST SUITE UNTIL IT PASSES
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: tests-until-pass
+    depends_on: [validate]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        Run the project's test suite and ensure it passes.
+
+        1. Run `bun run test`.
+        2. If it passes, output: <promise>TESTS_PASS</promise>
+        3. If it fails, read the failures, fix the root cause in the code
+           (or the test if the test is wrong), and run again.
+        4. Do NOT skip, xfail, or comment out failing tests to make them pass.
+
+        When all tests pass: <promise>TESTS_PASS</promise>
+      until: TESTS_PASS
+      max_iterations: 6
+      until_bash: "bun run test"
+      fresh_context: false
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 5: CODERABBIT REVIEW + FIX
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: coderabbit-review
+    command: archon-coderabbit-review
+    depends_on: [tests-until-pass]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 6: LINT + TYPE-CHECK UNTIL THEY PASS
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: lint-types-until-pass
+    depends_on: [coderabbit-review]
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        Run lint and type-check, and fix any issues until both pass cleanly.
+
+        1. Run `bun run lint` and `bun run type-check`.
+        2. If both pass with zero errors and zero warnings, output:
+           <promise>LINT_TYPES_PASS</promise>
+        3. Otherwise, fix the root cause of each error/warning, then run again.
+        4. Do NOT add inline eslint-disable comments or `as any` casts to
+           silence findings — fix the underlying issue.
+
+        When lint and type-check both pass: <promise>LINT_TYPES_PASS</promise>
+      until: LINT_TYPES_PASS
+      max_iterations: 6
+      until_bash: "bun run lint && bun run type-check"
+      fresh_context: false
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 7: CREATE PR + PUSH
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: finalize-pr
+    command: archon-finalize-pr
+    depends_on: [lint-types-until-pass]
+    context: fresh
