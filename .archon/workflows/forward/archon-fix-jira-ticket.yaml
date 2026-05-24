@@ -6,14 +6,23 @@ description: |
   NOT for: GitHub issues (use archon-fix-github-issue),
            questions about tickets, CI failures, PR reviews, general exploration.
 
-  Requires environment variables (any of the standard Atlassian Cloud auth vars):
-    JIRA_BASE_URL  (e.g. https://yourcompany.atlassian.net)
-    JIRA_EMAIL     (Atlassian account email)
-    JIRA_API_TOKEN (Atlassian API token — https://id.atlassian.com/manage-profile/security/api-tokens)
+  Requires:
+    - `npx` on PATH (Node.js — used to launch `mcp-remote`).
+    - A one-time OAuth handshake with Atlassian's remote MCP. Run this once
+      in a terminal to cache credentials in `~/.mcp-auth/`:
+          npx -y mcp-remote https://mcp.atlassian.com/v1/mcp
+      A browser window will open; sign in to the same Atlassian account
+      that Claude Code uses. After that the workflow reuses the cached
+      tokens silently — no env vars, no API tokens, no URLs to manage.
+
+    The workflow talks to Atlassian's official remote MCP
+    (https://mcp.atlassian.com/v1/mcp) — the same endpoint your Claude Code
+    session uses. Multiple Atlassian sites are supported; the workflow looks
+    up the right `cloudId` automatically via `getAccessibleAtlassianResources`.
 
   DAG workflow that:
   1. Extracts the Jira ticket key (e.g. PROJ-123) from the user request
-  2. Fetches the ticket via the Jira REST API
+  2. Fetches the ticket via the Atlassian remote MCP server
   3. Classifies the work (bug/feature/enhancement/etc)
   4. Researches context (web research + codebase exploration via investigate/plan)
   5. Routes to investigate (bugs) or plan (features) based on classification
@@ -50,91 +59,110 @@ nodes:
     model: haiku
 
   - id: fetch-ticket
-    bash: |
-      set -e
-
-      TICKET_KEY=$(echo "$extract-ticket-key.output" | tr -d "'\"\`\n " | grep -oE '[A-Z][A-Z0-9_]+-[0-9]+' | head -1)
-      if [ -z "$TICKET_KEY" ]; then
-        echo "Failed to extract Jira ticket key from: $extract-ticket-key.output" >&2
-        exit 1
-      fi
-
-      : "${JIRA_BASE_URL:?JIRA_BASE_URL must be set (e.g. https://yourcompany.atlassian.net)}"
-      : "${JIRA_EMAIL:?JIRA_EMAIL must be set (Atlassian account email)}"
-      : "${JIRA_API_TOKEN:?JIRA_API_TOKEN must be set (Atlassian API token)}"
-
-      # Strip any trailing slash from the base URL
-      BASE_URL="${JIRA_BASE_URL%/}"
-      TICKET_URL="$BASE_URL/browse/$TICKET_KEY"
-
-      # Persist key + URL for downstream nodes
-      mkdir -p "$ARTIFACTS_DIR"
-      echo -n "$TICKET_KEY" > "$ARTIFACTS_DIR/.ticket-key"
-      echo -n "$TICKET_URL" > "$ARTIFACTS_DIR/.ticket-url"
-
-      RESPONSE=$(curl -sS --fail-with-body -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-        -H "Accept: application/json" \
-        "$BASE_URL/rest/api/3/issue/$TICKET_KEY?fields=summary,description,status,issuetype,priority,labels,components,reporter,assignee,comment")
-
-      # Save raw JSON for any later step that wants structured access
-      echo "$RESPONSE" > "$ARTIFACTS_DIR/jira-ticket.json"
-
-      # Build a human-readable rendering for downstream prompts
-      bun -e '
-        const data = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-        const f = data.fields ?? {};
-        const adfToText = (node) => {
-          if (!node) return "";
-          if (typeof node === "string") return node;
-          if (node.type === "text") return node.text ?? "";
-          if (node.type === "hardBreak") return "\n";
-          if (Array.isArray(node.content)) {
-            const inner = node.content.map(adfToText).join("");
-            if (node.type === "paragraph" || node.type === "heading") return inner + "\n\n";
-            if (node.type === "bulletList" || node.type === "orderedList") return inner + "\n";
-            if (node.type === "listItem") return "- " + inner;
-            if (node.type === "codeBlock") return "```\n" + inner + "\n```\n\n";
-            return inner;
-          }
-          return "";
-        };
-        const desc = adfToText(f.description) || "(no description)";
-        const lines = [];
-        lines.push(`# ${data.key}: ${f.summary ?? "(no summary)"}`);
-        lines.push("");
-        lines.push(`- URL: ${process.argv[2]}`);
-        lines.push(`- Type: ${f.issuetype?.name ?? "unknown"}`);
-        lines.push(`- Status: ${f.status?.name ?? "unknown"}`);
-        lines.push(`- Priority: ${f.priority?.name ?? "unset"}`);
-        lines.push(`- Reporter: ${f.reporter?.displayName ?? "unknown"}`);
-        lines.push(`- Assignee: ${f.assignee?.displayName ?? "unassigned"}`);
-        if (Array.isArray(f.labels) && f.labels.length) lines.push(`- Labels: ${f.labels.join(", ")}`);
-        if (Array.isArray(f.components) && f.components.length) lines.push(`- Components: ${f.components.map(c => c.name).join(", ")}`);
-        lines.push("");
-        lines.push("## Description");
-        lines.push("");
-        lines.push(desc.trim());
-        const comments = f.comment?.comments ?? [];
-        if (comments.length) {
-          lines.push("");
-          lines.push("## Comments");
-          for (const c of comments) {
-            const author = c.author?.displayName ?? "unknown";
-            const when = c.created ?? "";
-            const body = adfToText(c.body).trim();
-            lines.push("");
-            lines.push(`### ${author} — ${when}`);
-            lines.push("");
-            lines.push(body);
-          }
-        }
-        process.stdout.write(lines.join("\n"));
-      ' "$ARTIFACTS_DIR/jira-ticket.json" "$TICKET_URL" > "$ARTIFACTS_DIR/jira-ticket.md"
-
-      # Emit the markdown rendering as this node's output for downstream substitution
-      cat "$ARTIFACTS_DIR/jira-ticket.md"
     depends_on: [extract-ticket-key]
-    timeout: 30000
+    mcp: /Users/dvictory/.archon/mcp/atlassian.json
+    allowed_tools: [Bash, Write, Read]
+    prompt: |
+      Fetch a Jira ticket via the Atlassian remote MCP server, render it as
+      markdown, and persist artifacts for downstream nodes.
+
+      ## Step 1 — resolve the ticket key
+
+      The previous node produced:
+
+          $extract-ticket-key.output
+
+      Normalize that output to a bare key matching `[A-Z][A-Z0-9_]+-[0-9]+`
+      (strip quotes, whitespace, backticks). If no valid key can be extracted,
+      **exit with a clear error message and do not call any tools**.
+
+      ## Step 2 — look up the Atlassian cloudId
+
+      Call `getAccessibleAtlassianResources` (no arguments). This returns a list
+      of Atlassian sites the user has access to. Each entry has `id` (cloudId),
+      `url` (site URL like `https://acme.atlassian.net`), `name`, and `scopes`.
+
+      Pick the right site:
+      - If exactly one site is returned, use it.
+      - If multiple sites are returned, choose the one whose project prefix
+        matches the ticket key (e.g. `PROJ-123` → site that contains project
+        `PROJ`). If you cannot disambiguate, prefer the first entry whose
+        scopes include Jira and surface a note in your final output that you
+        guessed.
+
+      Remember the chosen site's `id` (cloudId) and `url`.
+
+      ## Step 3 — fetch the issue via MCP
+
+      Call `getJiraIssue` with:
+      - `cloudId`: the id from Step 2
+      - `issueIdOrKey`: the resolved ticket key
+
+      The tool returns the full Jira issue payload (fields, comments, etc).
+
+      If either MCP call fails, surface the error verbatim and exit — do NOT
+      fall back silently. The user needs to know auth or connectivity is broken.
+
+      ## Step 4 — derive the ticket URL
+
+      The browse URL is `<site url>/browse/<KEY>` using the `url` from Step 2.
+      Strip any trailing slash from the site URL.
+
+      ## Step 5 — write artifacts to $ARTIFACTS_DIR
+
+      Use the `Write` tool to create:
+
+      1. `$ARTIFACTS_DIR/.ticket-key` — the bare key, no trailing newline
+      2. `$ARTIFACTS_DIR/.ticket-url` — the browse URL, no trailing newline
+      3. `$ARTIFACTS_DIR/jira-ticket.json` — the raw MCP tool response as JSON
+         (pretty-printed is fine)
+      4. `$ARTIFACTS_DIR/jira-ticket.md` — the human-readable rendering described
+         in Step 6
+
+      `$ARTIFACTS_DIR` already exists; you can `mkdir -p` it defensively if needed.
+
+      ## Step 6 — render markdown
+
+      Build `jira-ticket.md` with this structure:
+
+      ```
+      # <KEY>: <summary>
+
+      - URL: <browse URL>
+      - Type: <issue type name>
+      - Status: <status name>
+      - Priority: <priority name or "unset">
+      - Reporter: <display name>
+      - Assignee: <display name or "unassigned">
+      - Labels: <comma-separated, omit line if empty>
+      - Components: <comma-separated names, omit line if empty>
+
+      ## Description
+
+      <description as plain markdown — if the field is Atlassian Document Format,
+      convert it to readable markdown: paragraphs/headings/bullet lists/code blocks.
+      If empty, write "(no description)".>
+
+      ## Comments
+
+      ### <author display name> — <created timestamp>
+
+      <comment body as markdown>
+
+      ### <next author> — <timestamp>
+
+      <body>
+      ```
+
+      If the issue has no comments, omit the `## Comments` section entirely.
+
+      ## Step 7 — final output
+
+      Your **final message** (the value of `$fetch-ticket.output`) must be the
+      contents of `jira-ticket.md` and **nothing else** — no preamble, no tool
+      narration, no trailing summary. Downstream nodes substitute this output
+      directly into their prompts.
+    timeout: 60000
 
   - id: classify
     prompt: |
@@ -594,16 +622,20 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
   # PHASE 11: REPORT BACK TO JIRA
   # Posts a completion comment on the original Jira ticket via the
-  # Atlassian REST API. Inlined (instead of using the GitHub-only
-  # archon-issue-completion-report command) because the Jira comment
-  # API uses Atlassian Document Format, not Markdown.
+  # Atlassian remote MCP server. The MCP converts Markdown to Atlassian
+  # Document Format internally, so we send Markdown directly.
   # ═══════════════════════════════════════════════════════════════
 
   - id: report
+    depends_on: [final-validate]
+    context: fresh
+    mcp: /Users/dvictory/.archon/mcp/atlassian.json
     prompt: |
       You are posting a completion comment back to the originating Jira ticket.
 
-      ## Sources of truth (read these before composing the comment)
+      ## Sources of truth
+
+      Read these before composing the comment:
 
       ```bash
       TICKET_KEY=$(cat "$ARTIFACTS_DIR/.ticket-key")
@@ -634,59 +666,31 @@ nodes:
          with a one-line reason.
       7. **Suggested follow-ups** — concrete next tickets, if any.
 
-      ## Post the comment to Jira
+      ## Post the comment to Jira via MCP
 
-      The Jira REST API requires Atlassian Document Format (ADF) for comment bodies.
-      Construct ADF from the markdown report and POST it. Use this exact pattern:
+      The Atlassian remote MCP is multi-tenant, so calls need a `cloudId`.
 
-      ```bash
-      BASE_URL="${JIRA_BASE_URL%/}"
+      1. Call `getAccessibleAtlassianResources` (no args). Pick the entry whose
+         `url` matches the host portion of `TICKET_URL` (or, if only one entry
+         is returned, use it). Remember its `id` (the cloudId).
+      2. Call `addCommentToJiraIssue` with:
+         - `cloudId`: the id from step 1
+         - `issueIdOrKey`: the value of `TICKET_KEY`
+         - `commentBody`: the full Markdown contents of
+           `$ARTIFACTS_DIR/completion-report.md`
 
-      # Build an ADF body from the markdown report. Keep it simple: one paragraph per
-      # markdown line, preserving headings as bold paragraphs and bullets as a list.
-      bun -e '
-        const fs = require("fs");
-        const md = fs.readFileSync(process.argv[1], "utf8");
-        const content = [];
-        for (const rawLine of md.split(/\r?\n/)) {
-          const line = rawLine.trimEnd();
-          if (!line.trim()) continue;
-          if (line.startsWith("# ")) {
-            content.push({ type: "heading", attrs: { level: 1 }, content: [{ type: "text", text: line.slice(2) }] });
-          } else if (line.startsWith("## ")) {
-            content.push({ type: "heading", attrs: { level: 2 }, content: [{ type: "text", text: line.slice(3) }] });
-          } else if (line.startsWith("### ")) {
-            content.push({ type: "heading", attrs: { level: 3 }, content: [{ type: "text", text: line.slice(4) }] });
-          } else if (line.startsWith("- ") || line.startsWith("* ")) {
-            const last = content[content.length - 1];
-            const item = { type: "listItem", content: [{ type: "paragraph", content: [{ type: "text", text: line.slice(2) }] }] };
-            if (last && last.type === "bulletList") last.content.push(item);
-            else content.push({ type: "bulletList", content: [item] });
-          } else {
-            content.push({ type: "paragraph", content: [{ type: "text", text: line }] });
-          }
-        }
-        const body = { body: { version: 1, type: "doc", content } };
-        process.stdout.write(JSON.stringify(body));
-      ' "$ARTIFACTS_DIR/completion-report.md" > "$ARTIFACTS_DIR/.jira-comment.json"
+      The Atlassian MCP converts Markdown to Atlassian Document Format (ADF)
+      internally — do NOT build ADF by hand and do NOT shell out to curl.
 
-      curl -sS --fail-with-body -X POST \
-        -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-        -H "Content-Type: application/json" \
-        -H "Accept: application/json" \
-        --data @"$ARTIFACTS_DIR/.jira-comment.json" \
-        "$BASE_URL/rest/api/3/issue/$TICKET_KEY/comment"
-      ```
-
-      If the POST fails (non-2xx), surface the error in your final response. Do NOT
-      silently swallow failures — the user needs to know if the Jira comment didn't land.
+      If either MCP call fails, surface the error verbatim in your final response.
+      Do NOT silently swallow failures — the user needs to know if the Jira comment
+      didn't land.
 
       ## Final response to the user
 
-      Print a short markdown summary to stdout:
+      Print a short markdown summary as your final message:
       - Ticket key + URL
       - PR number + URL
-      - Whether the Jira comment was posted successfully
+      - Whether the Jira comment was posted successfully (include the comment ID
+        returned by `addCommentToJiraIssue` if available)
       - Top 3 follow-up suggestions (if any)
-    depends_on: [final-validate]
-    context: fresh
