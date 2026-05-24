@@ -218,13 +218,50 @@ async function findPackagedWorkflowAt(
   return match;
 }
 
+/**
+ * Search one level of plain subdirectories under `workflowsRoot` for
+ * `<name>.yaml`. Mirrors the depth-1 descent `discoverWorkflows` performs, which
+ * `findPackagedWorkflowAt` does not cover — packaged lookup requires the
+ * two-level `<pack>/<workflow-folder>/<single>.yaml` layout, so workflows curated
+ * into a flat subfolder (`.archon/workflows/forward/*.yaml`,
+ * `~/.archon/workflows/<group>/*.yaml`) resolve only here. Directories are
+ * detected with `stat`, not `lstat`, so symlink-curated groups are followed.
+ */
+async function findWorkflowInSubfolders(
+  workflowsRoot: string,
+  name: string
+): Promise<RawWorkflowFile | null> {
+  let entries: string[];
+  try {
+    entries = await readdir(workflowsRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+
+  for (const entry of entries.sort((a, b) => a.localeCompare(b))) {
+    if (!isValidWorkflowFolderSegment(entry)) continue;
+    const entryPath = join(workflowsRoot, entry);
+    try {
+      if (!(await stat(entryPath)).isDirectory()) continue;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    const hit = await tryReadWorkflowAt(entryPath, name);
+    if (hit) return { ...hit, filename: `${entry}/${hit.filename}` };
+  }
+  return null;
+}
+
 async function findWorkflowAt(
   workflowsRoot: string,
   name: string
 ): Promise<RawWorkflowFile | null> {
   return (
     (await tryReadWorkflowAt(workflowsRoot, name)) ??
-    (await findPackagedWorkflowAt(workflowsRoot, name))
+    (await findPackagedWorkflowAt(workflowsRoot, name)) ??
+    (await findWorkflowInSubfolders(workflowsRoot, name))
   );
 }
 
